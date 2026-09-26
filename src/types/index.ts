@@ -42,6 +42,13 @@ export {
   NotFoundError,
   NetworkError,
 } from './errors';
+export type {
+  ErrorHandler,
+  ErrorHandlerAction,
+  ErrorHandlerContext,
+  Middleware,
+  MiddlewareContext,
+} from './errors';
 
 // Schema exports for consumer validation
 export {
