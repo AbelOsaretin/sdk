@@ -19,6 +19,7 @@ export type {
 } from './http/interceptors';
 export type { RequestOptions } from './http/http-client';
 export { RequestQueue, type RequestQueueOptions } from './http/request-queue';
+export { ConnectionPool, type ConnectionPoolOptions, type ConnectionPoolStats } from './http/connection-pool';
 export {
   OfflineQueue,
   type OfflineQueueOptions,

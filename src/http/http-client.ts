@@ -10,7 +10,10 @@ import { ApiError, DorisioError, ErrorHandler, ErrorHandlerContext } from '../ty
 import { InterceptorManager } from './interceptors';
 import { generateRequestId, isRequestIdempotent, RetryConflictError } from './retry-manager';
 import { MockRouter, type SandboxHistoryEntry } from '../sandbox/mock-router';
-import { isRequestIdempotent } from './retry-manager';
+import { ConnectionPool, type ConnectionPoolOptions } from './connection-pool';
+import { RequestQueue } from './request-queue';
+import { OfflineQueue } from './offline-queue';
+import { MetricsCollector } from '../lib/metrics';
 
 export type HttpClientMode = 'live' | 'sandbox' | 'production';
 
@@ -60,6 +63,7 @@ export interface HttpClientOptions {
   deduplicationWindow?: number;
   /** Custom error handler for error recovery strategies */
   errorHandler?: ErrorHandler;
+  connectionPool?: ConnectionPoolOptions;
 }
 
 function normalizeMode(mode?: HttpClientMode): 'live' | 'sandbox' {
@@ -151,6 +155,10 @@ export class HttpClient {
   private deduplicationWindow: number;
   private deduplicationCache = new Map<string, CachedRequest>();
   private errorHandler?: ErrorHandler;
+  private readonly connectionPool: ConnectionPool;
+  private readonly metricsCollector = new MetricsCollector();
+  private readonly requestQueue?: RequestQueue;
+  private readonly offlineQueue?: OfflineQueue;
 
   constructor(baseUrl: string, options?: HttpClientOptions) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -172,6 +180,7 @@ export class HttpClient {
     this.deduplicateRequests = options?.deduplicateRequests ?? false;
     this.deduplicationWindow = options?.deduplicationWindow ?? 1000;
     this.errorHandler = options?.errorHandler;
+    this.connectionPool = new ConnectionPool(options?.connectionPool);
     if (this.deduplicationWindow < 0) {
       throw new Error('deduplicationWindow must be greater than or equal to zero');
     }
@@ -239,6 +248,10 @@ export class HttpClient {
   /** Ids of the logical requests currently in flight. */
   getInFlightRequestIds(): string[] {
     return [...this.inFlightRequests];
+  }
+
+  getConnectionPoolStats() {
+    return this.connectionPool.stats();
   }
 
   configureSandbox(options: {
@@ -383,15 +396,17 @@ export class HttpClient {
     const headers = { ...this.defaultHeaders, ...options.headers };
 
     let lastError: Error | null = null;
-    const attempts = finalOptions.retries ?? this.retryAttempts;
+    const attempts = options.retries ?? this.retryAttempts;
     const canRetry = isRequestIdempotent({
-      method: finalOptions.method,
-      isIdempotent: finalOptions.isIdempotent,
+      method: options.method,
+      isIdempotent: options.isIdempotent,
       headers,
     });
 
     for (let attempt = 0; attempt < attempts; attempt++) {
+      let release: (() => void) | undefined;
       try {
+        release = await this.connectionPool.acquire(options.signal);
         const startedAt = Date.now();
         this.log('[DORISIO] request', {
           method: options.method,
@@ -440,7 +455,6 @@ export class HttpClient {
         }
 
         const data = (await response.json()) as T;
-
         return await this.interceptors.executeResponseInterceptors(data);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -508,10 +522,16 @@ export class HttpClient {
         if (attempt < attempts - 1) {
           await new Promise((resolve) => setTimeout(resolve, Math.pow(2, attempt) * 1000));
         }
+      } finally {
+        release?.();
       }
     }
 
     throw lastError || new Error('Request failed after retries');
+  }
+
+  private log(message: string, data?: unknown): void {
+    if (this.debug) this.logger(message, data);
   }
 
   /**
