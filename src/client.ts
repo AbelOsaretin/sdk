@@ -9,7 +9,15 @@
 import { HttpClient, RequestOptions, type HttpClientMode } from './http/http-client';
 import { getConfig } from './config';
 import { ApiResponse } from './types/api';
-import { Creator, CreatorProfile, Transaction, TransactionHistory, TransactionStats, User, Wallet } from './types/models';
+import {
+  Creator,
+  CreatorProfile,
+  Transaction,
+  TransactionHistory,
+  TransactionStats,
+  User,
+  Wallet,
+} from './types/models';
 import { BalanceInfo, AccountBalance } from './client/balance';
 import { SessionInfo } from './client/auth';
 import { VerificationStatus } from './client/verification';
@@ -29,8 +37,11 @@ import * as balanceMethods from './client/balance';
 import * as verificationMethods from './client/verification';
 import * as authMethods from './client/auth';
 import { CreateWalletRequest, UpdateWalletRequest } from './types/models';
-import type { MetricsCallback, MetricsSummary } from './lib/metrics';
-import type { OfflineEventType, OfflineEventListener } from './http/offline-queue';
+import * as batchMethods from './client/batch-operations';
+import {
+  ErrorHandler,
+  Middleware,
+} from './types/errors';
 
 export type ClientMode = 'sandbox' | 'live' | 'production';
 
@@ -49,26 +60,12 @@ export interface ClientConfig {
   sandboxLatency?: number;
   /** Sandbox random error rate 0–1 (default 0) */
   sandboxErrorRate?: number;
-  /**
-   * Enable request queue with concurrency control and automatic 429 backoff.
-   */
-  enableRequestQueue?: boolean;
-  /**
-   * Maximum concurrent requests in flight when request queue is enabled (default: 5).
-   */
-  maxConcurrentRequests?: number;
-  /**
-   * Enable offline mutation queue.
-   */
-  enableOfflineQueue?: boolean;
-  /**
-   * Enable performance metrics collection.
-   */
-  enableMetrics?: boolean;
-  /**
-   * Optional callback invoked whenever a request metric is recorded.
-   */
-  metricsCallback?: MetricsCallback;
+  debug?: boolean;
+  logger?: (message: string, data?: unknown) => void;
+  deduplicateRequests?: boolean;
+  deduplicationWindow?: number;
+  /** Custom error handler for error recovery strategies */
+  errorHandler?: ErrorHandler;
 }
 
 function normalizeClientMode(mode?: ClientMode): 'live' | 'sandbox' {
@@ -81,6 +78,8 @@ export class DorisioClient {
   private httpClient: HttpClient;
   private token?: string;
   private mode: 'live' | 'sandbox';
+  private errorHandler?: ErrorHandler;
+  private middleware: Middleware[] = [];
 
   constructor(config: ClientConfig) {
     const mode = normalizeClientMode(config.mode);
@@ -93,15 +92,16 @@ export class DorisioClient {
       sandboxSeed: config.sandboxSeed,
       sandboxLatency: config.sandboxLatency,
       sandboxErrorRate: config.sandboxErrorRate,
-      enableRequestQueue: config.enableRequestQueue,
-      maxConcurrentRequests: config.maxConcurrentRequests,
-      enableOfflineQueue: config.enableOfflineQueue,
-      enableMetrics: config.enableMetrics,
-      metricsCallback: config.metricsCallback,
+      debug: config.debug,
+      logger: config.logger,
+      deduplicateRequests: config.deduplicateRequests,
+      deduplicationWindow: config.deduplicationWindow,
+      errorHandler: config.errorHandler,
     };
 
     this.token = config.token;
     this.mode = mode;
+    this.errorHandler = config.errorHandler;
 
     this.httpClient = new HttpClient(this.config.baseUrl, {
       timeout: this.config.timeout,
@@ -110,11 +110,11 @@ export class DorisioClient {
       sandboxSeed: config.sandboxSeed,
       sandboxLatency: config.sandboxLatency,
       sandboxErrorRate: config.sandboxErrorRate,
-      enableRequestQueue: config.enableRequestQueue,
-      maxConcurrentRequests: config.maxConcurrentRequests,
-      enableOfflineQueue: config.enableOfflineQueue,
-      enableMetrics: config.enableMetrics,
-      metricsCallback: config.metricsCallback,
+      debug: config.debug,
+      logger: config.logger,
+      deduplicateRequests: config.deduplicateRequests,
+      deduplicationWindow: config.deduplicationWindow,
+      errorHandler: this.errorHandler,
     });
 
     if (this.token) {
@@ -180,6 +180,9 @@ export class DorisioClient {
     this.isAuthenticated = authMethods.isAuthenticated.bind(this);
     this.extendSession = authMethods.extendSession.bind(this);
     this.getSessionExpiry = authMethods.getSessionExpiry.bind(this);
+    this.getCreators = batchMethods.getCreators.bind(this);
+    this.getAllTransactionHistory = batchMethods.getAllTransactionHistory.bind(this);
+    this.getAllWalletBalances = batchMethods.getAllWalletBalances.bind(this);
   }
 
   /**
@@ -209,12 +212,46 @@ export class DorisioClient {
     body?: unknown,
     options?: Partial<RequestOptions>
   ): Promise<ApiResponse<T>> {
-    const data = await this.httpClient.request<ApiResponse<T>>(path, {
-      method,
-      body: body as Record<string, unknown>,
-      ...options,
-    });
-    return data;
+    const requestBody = body;
+    const requestHeaders = options?.headers;
+
+    // Execute middleware chain for request transformation
+    const executeMiddleware = async (index: number): Promise<ApiResponse<T>> => {
+      if (index >= this.middleware.length) {
+        // All middleware executed, make the actual request
+        return this.httpClient.request<ApiResponse<T>>(path, {
+          method,
+          body: requestBody as Record<string, unknown>,
+          headers: requestHeaders,
+          ...options,
+        });
+      }
+
+      const middleware = this.middleware[index];
+      if (!middleware) {
+        return this.httpClient.request<ApiResponse<T>>(path, {
+          method,
+          body: requestBody as Record<string, unknown>,
+          headers: requestHeaders,
+          ...options,
+        });
+      }
+
+      const result = await middleware(
+        {
+          method,
+          path,
+          body: requestBody,
+          headers: requestHeaders,
+          requestId: options?.requestId,
+        },
+        () => executeMiddleware(index + 1)
+      );
+
+      return result as ApiResponse<T>;
+    };
+
+    return executeMiddleware(0);
   }
 
   /**
@@ -276,47 +313,18 @@ export class DorisioClient {
   }
 
   /**
-   * Get performance metrics summary
+   * Register a custom error handler for error recovery strategies
    */
-  getMetrics(): MetricsSummary {
-    return this.httpClient.getMetrics();
+  onError(handler: ErrorHandler): void {
+    this.errorHandler = handler;
+    this.httpClient.setErrorHandler(handler);
   }
 
   /**
-   * Check if client considers itself online
+   * Register middleware for request/response transformation
    */
-  isOnline(): boolean {
-    return this.httpClient.isOnline();
-  }
-
-  /**
-   * Set online status (triggers offline queue replay when switching to true)
-   */
-  setOnline(online: boolean): void {
-    this.httpClient.setOnline(online);
-  }
-
-  /**
-   * Get number of mutations currently queued offline
-   */
-  getOfflineQueueSize(): number {
-    return this.httpClient.getOfflineQueueSize();
-  }
-
-  /**
-   * Listen to offline events ('online', 'offline', 'queue-processed')
-   */
-  on(event: OfflineEventType, listener: OfflineEventListener): this {
-    this.httpClient.getOfflineQueue()?.on(event, listener);
-    return this;
-  }
-
-  /**
-   * Remove an offline event listener
-   */
-  off(event: OfflineEventType, listener: OfflineEventListener): this {
-    this.httpClient.getOfflineQueue()?.off(event, listener);
-    return this;
+  use(middleware: Middleware): void {
+    this.middleware.push(middleware);
   }
 
   // ---------------------------------------------------------------------------
@@ -458,4 +466,11 @@ export class DorisioClient {
     expiresIn: number;
     isExpired: boolean;
   }>;
+
+  declare getCreators: (creatorIds: string[], concurrency?: number) => Promise<Creator[]>;
+  declare getAllTransactionHistory: (pageSize?: number) => Promise<TransactionHistory>;
+  declare getAllWalletBalances: (
+    walletIds: string[],
+    concurrency?: number
+  ) => Promise<BalanceInfo[]>;
 }
