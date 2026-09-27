@@ -353,28 +353,44 @@ export class DorisioClient {
   // ---------------------------------------------------------------------------
   // Transaction methods
   // ---------------------------------------------------------------------------
-  declare createTip: (data: CreateTipRequest) => Promise<Transaction>;
-  declare getTipStatus: (transactionId: string) => Promise<Transaction>;
-  declare getTransactionHistory: (options?: {
-    page?: number;
-    pageSize?: number;
-  }) => Promise<TransactionHistory>;
+  declare createTip: (
+    data: CreateTipRequest,
+    options?: Partial<RequestOptions>
+  ) => Promise<Transaction>;
+  declare getTipStatus: (
+    transactionId: string,
+    options?: Partial<RequestOptions>
+  ) => Promise<Transaction>;
+  declare getTransactionHistory: (
+    options?: {
+      page?: number;
+      pageSize?: number;
+    },
+    requestOptions?: Partial<RequestOptions>
+  ) => Promise<TransactionHistory>;
   declare getCreatorTipsReceived: (
     creatorId: string,
-    options?: { page?: number; pageSize?: number }
+    options?: { page?: number; pageSize?: number },
+    requestOptions?: Partial<RequestOptions>
   ) => Promise<TransactionHistory>;
   declare buildPaymentTransaction: (
     tipId: string,
-    data: BuildTransactionRequest
+    data: BuildTransactionRequest,
+    options?: Partial<RequestOptions>
   ) => Promise<BuildTransactionResponse>;
   declare submitPaymentTransaction: (
     tipId: string,
-    data: SubmitTransactionRequest
+    data: SubmitTransactionRequest,
+    options?: Partial<RequestOptions>
   ) => Promise<SubmitTransactionResponse>;
-  declare checkTransactionConfirmation: (tipId: string) => Promise<Transaction>;
+  declare checkTransactionConfirmation: (
+    tipId: string,
+    options?: Partial<RequestOptions>
+  ) => Promise<Transaction>;
   declare updateTipStatus: (
     tipId: string,
-    status: 'pending' | 'completed' | 'failed' | 'cancelled'
+    status: 'pending' | 'completed' | 'failed' | 'cancelled',
+    options?: Partial<RequestOptions>
   ) => Promise<Transaction>;
 
   // ---------------------------------------------------------------------------

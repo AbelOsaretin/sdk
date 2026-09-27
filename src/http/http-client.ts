@@ -262,12 +262,8 @@ export class HttpClient {
   /**
    * Make HTTP request (or mock when in sandbox mode)
    *
-   * A `401 Unauthorized` is recoverable: when a token refresher is registered
-   * the session is renewed once and the request replayed with the new token. If
-   * the refresh itself fails, the original 401 is surfaced so the caller can log
-   * the user out. The refresh is never attempted for
-   * {@link AUTH_ENDPOINTS} (that would recurse) nor for requests that carry no
-   * credentials (nothing to renew).
+   * Routes through OfflineQueue and RequestQueue when configured,
+   * records performance metrics, and supports 401 token refresh.
    */
   async request<T>(path: string, options: RequestOptions): Promise<T> {
     const requestId = options.requestId ?? generateRequestId('http');
@@ -422,7 +418,25 @@ export class HttpClient {
 
         if (!response.ok) {
           const error = await response.json().catch(() => ({}));
-          throw new ApiError(error.error || 'Request failed', response.status, error.code);
+          const retryAfterHeader = response.headers?.get?.('Retry-After');
+          let retryAfter: number | undefined;
+          if (retryAfterHeader) {
+            const parsedSeconds = Number(retryAfterHeader);
+            if (!Number.isNaN(parsedSeconds)) {
+              retryAfter = parsedSeconds;
+            } else {
+              const parsedDate = Date.parse(retryAfterHeader);
+              if (!Number.isNaN(parsedDate)) {
+                retryAfter = Math.max(0, Math.ceil((parsedDate - Date.now()) / 1000));
+              }
+            }
+          }
+          throw new ApiError(
+            error.error || 'Request failed',
+            response.status,
+            error.code,
+            retryAfter
+          );
         }
 
         const data = (await response.json()) as T;
@@ -500,7 +514,54 @@ export class HttpClient {
     throw lastError || new Error('Request failed after retries');
   }
 
-  private log(message: string, data: unknown): void {
-    if (this.debug) this.logger(message, data);
+  /**
+   * Get performance metrics summary
+   */
+  getMetrics(): MetricsSummary {
+    return this.metricsCollector.getMetrics();
+  }
+
+  /**
+   * Get metrics collector instance
+   */
+  getMetricsCollector(): MetricsCollector {
+    return this.metricsCollector;
+  }
+
+  /**
+   * Get request queue instance if enabled
+   */
+  getRequestQueue(): RequestQueue | undefined {
+    return this.requestQueue;
+  }
+
+  /**
+   * Get offline queue instance if enabled
+   */
+  getOfflineQueue(): OfflineQueue | undefined {
+    return this.offlineQueue;
+  }
+
+  /**
+   * Check if client considers itself online
+   */
+  isOnline(): boolean {
+    return this.offlineQueue ? this.offlineQueue.isOnline() : true;
+  }
+
+  /**
+   * Set online status (triggers queue processing when switching from false to true)
+   */
+  setOnline(online: boolean): void {
+    if (this.offlineQueue) {
+      this.offlineQueue.setOnline(online);
+    }
+  }
+
+  /**
+   * Get number of mutations currently queued offline
+   */
+  getOfflineQueueSize(): number {
+    return this.offlineQueue ? this.offlineQueue.getQueueSize() : 0;
   }
 }
