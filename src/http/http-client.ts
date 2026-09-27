@@ -281,6 +281,10 @@ export class HttpClient {
     return [...this.inFlightRequests];
   }
 
+  getConnectionPoolStats() {
+    return this.connectionPool.stats();
+  }
+
   configureSandbox(options: {
     seed?: number;
     latency?: number;
@@ -487,7 +491,9 @@ export class HttpClient {
     });
 
     for (let attempt = 0; attempt < attempts; attempt++) {
+      let release: (() => void) | undefined;
       try {
+        release = await this.connectionPool.acquire(options.signal);
         const startedAt = Date.now();
         this.log('[DORISIO] request', {
           method: options.method,
@@ -538,7 +544,6 @@ export class HttpClient {
         }
 
         const data = (await response.json()) as T;
-
         return await this.interceptors.executeResponseInterceptors(data);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -610,10 +615,16 @@ export class HttpClient {
         if (attempt < attempts - 1) {
           await new Promise((resolve) => setTimeout(resolve, Math.pow(2, attempt) * 1000));
         }
+      } finally {
+        release?.();
       }
     }
 
     throw lastError || new Error('Request failed after retries');
+  }
+
+  private log(message: string, data?: unknown): void {
+    if (this.debug) this.logger(message, data);
   }
 
   /**
