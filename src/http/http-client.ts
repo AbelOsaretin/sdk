@@ -6,7 +6,7 @@
  * and sandbox/mock mode for offline testing.
  */
 
-import { ApiError } from '../types';
+import { ApiError, DorisioError, ErrorHandler, ErrorHandlerContext } from '../types';
 import { InterceptorManager } from './interceptors';
 import { generateRequestId, isRequestIdempotent, RetryConflictError } from './retry-manager';
 import { MockRouter, type SandboxHistoryEntry } from '../sandbox/mock-router';
@@ -58,6 +58,8 @@ export interface HttpClientOptions {
   /** Reuse an in-flight or recently completed identical request. */
   deduplicateRequests?: boolean;
   deduplicationWindow?: number;
+  /** Custom error handler for error recovery strategies */
+  errorHandler?: ErrorHandler;
 }
 
 function normalizeMode(mode?: HttpClientMode): 'live' | 'sandbox' {
@@ -148,6 +150,7 @@ export class HttpClient {
   private deduplicateRequests: boolean;
   private deduplicationWindow: number;
   private deduplicationCache = new Map<string, CachedRequest>();
+  private errorHandler?: ErrorHandler;
 
   constructor(baseUrl: string, options?: HttpClientOptions) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -168,6 +171,7 @@ export class HttpClient {
     this.logger = options?.logger ?? ((message, data) => console.debug(message, data));
     this.deduplicateRequests = options?.deduplicateRequests ?? false;
     this.deduplicationWindow = options?.deduplicationWindow ?? 1000;
+    this.errorHandler = options?.errorHandler;
     if (this.deduplicationWindow < 0) {
       throw new Error('deduplicationWindow must be greater than or equal to zero');
     }
@@ -188,6 +192,13 @@ export class HttpClient {
    */
   setTokenRefresher(refresher: () => Promise<void>): void {
     this.tokenRefresher = refresher;
+  }
+
+  /**
+   * Register a custom error handler for error recovery strategies
+   */
+  setErrorHandler(handler: ErrorHandler): void {
+    this.errorHandler = handler;
   }
 
   /**
@@ -425,6 +436,36 @@ export class HttpClient {
         // requests) — retrying an aborted fetch just burns attempts.
         if (options.signal?.aborted) {
           throw lastError;
+        }
+
+        // Call custom error handler if registered
+        if (this.errorHandler && lastError instanceof DorisioError) {
+          const context: ErrorHandlerContext = {
+            method: options.method,
+            path,
+            body: options.body,
+            headers: options.headers,
+            attempt: attempt + 1,
+            requestId: options.requestId,
+          };
+
+          try {
+            const action = await this.errorHandler(lastError, context);
+
+            if (action.action === 'retry') {
+              const delay = action.delayMs ?? Math.pow(2, attempt) * 1000;
+              if (attempt < attempts - 1) {
+                await new Promise((resolve) => setTimeout(resolve, delay));
+                continue;
+              }
+            } else if (action.action === 'fallback') {
+              return action.fallbackValue as T;
+            }
+            // action === 'throw' falls through to throw error
+          } catch (handlerError) {
+            // If error handler itself fails, log and continue with normal error handling
+            this.log('[DORISIO] error handler failed', { error: handlerError });
+          }
         }
 
         if (

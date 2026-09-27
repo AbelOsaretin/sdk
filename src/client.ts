@@ -38,6 +38,10 @@ import * as verificationMethods from './client/verification';
 import * as authMethods from './client/auth';
 import { CreateWalletRequest, UpdateWalletRequest } from './types/models';
 import * as batchMethods from './client/batch-operations';
+import {
+  ErrorHandler,
+  Middleware,
+} from './types/errors';
 
 export type ClientMode = 'sandbox' | 'live' | 'production';
 
@@ -60,6 +64,8 @@ export interface ClientConfig {
   logger?: (message: string, data?: unknown) => void;
   deduplicateRequests?: boolean;
   deduplicationWindow?: number;
+  /** Custom error handler for error recovery strategies */
+  errorHandler?: ErrorHandler;
 }
 
 function normalizeClientMode(mode?: ClientMode): 'live' | 'sandbox' {
@@ -72,6 +78,8 @@ export class DorisioClient {
   private httpClient: HttpClient;
   private token?: string;
   private mode: 'live' | 'sandbox';
+  private errorHandler?: ErrorHandler;
+  private middleware: Middleware[] = [];
 
   constructor(config: ClientConfig) {
     const mode = normalizeClientMode(config.mode);
@@ -88,10 +96,12 @@ export class DorisioClient {
       logger: config.logger,
       deduplicateRequests: config.deduplicateRequests,
       deduplicationWindow: config.deduplicationWindow,
+      errorHandler: config.errorHandler,
     };
 
     this.token = config.token;
     this.mode = mode;
+    this.errorHandler = config.errorHandler;
 
     this.httpClient = new HttpClient(this.config.baseUrl, {
       timeout: this.config.timeout,
@@ -104,6 +114,7 @@ export class DorisioClient {
       logger: config.logger,
       deduplicateRequests: config.deduplicateRequests,
       deduplicationWindow: config.deduplicationWindow,
+      errorHandler: this.errorHandler,
     });
 
     if (this.token) {
@@ -201,12 +212,46 @@ export class DorisioClient {
     body?: unknown,
     options?: Partial<RequestOptions>
   ): Promise<ApiResponse<T>> {
-    const data = await this.httpClient.request<ApiResponse<T>>(path, {
-      method,
-      body: body as Record<string, unknown>,
-      ...options,
-    });
-    return data;
+    const requestBody = body;
+    const requestHeaders = options?.headers;
+
+    // Execute middleware chain for request transformation
+    const executeMiddleware = async (index: number): Promise<ApiResponse<T>> => {
+      if (index >= this.middleware.length) {
+        // All middleware executed, make the actual request
+        return this.httpClient.request<ApiResponse<T>>(path, {
+          method,
+          body: requestBody as Record<string, unknown>,
+          headers: requestHeaders,
+          ...options,
+        });
+      }
+
+      const middleware = this.middleware[index];
+      if (!middleware) {
+        return this.httpClient.request<ApiResponse<T>>(path, {
+          method,
+          body: requestBody as Record<string, unknown>,
+          headers: requestHeaders,
+          ...options,
+        });
+      }
+
+      const result = await middleware(
+        {
+          method,
+          path,
+          body: requestBody,
+          headers: requestHeaders,
+          requestId: options?.requestId,
+        },
+        () => executeMiddleware(index + 1)
+      );
+
+      return result as ApiResponse<T>;
+    };
+
+    return executeMiddleware(0);
   }
 
   /**
@@ -265,6 +310,21 @@ export class DorisioClient {
    */
   configureSandbox(options: { seed?: number; latency?: number; errorRate?: number }): void {
     this.httpClient.configureSandbox(options);
+  }
+
+  /**
+   * Register a custom error handler for error recovery strategies
+   */
+  onError(handler: ErrorHandler): void {
+    this.errorHandler = handler;
+    this.httpClient.setErrorHandler(handler);
+  }
+
+  /**
+   * Register middleware for request/response transformation
+   */
+  use(middleware: Middleware): void {
+    this.middleware.push(middleware);
   }
 
   // ---------------------------------------------------------------------------
