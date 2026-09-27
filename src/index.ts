@@ -76,6 +76,7 @@ export type {
   CreatorEarningsResponse,
   TipRequest,
   CreateTipRequest,
+  Tip,
 } from './types';
 
 // Re-export utils
@@ -166,9 +167,14 @@ export {
   listCreatorTips,
   listVerifiedCreators,
   createPaginator,
+  encodeCursor,
+  decodeCursor,
   Paginator,
   type QueryOptions,
   type PaginationResult,
+  type PageFetcher,
+  type PageItem,
+  type ListClient,
 } from './lib/query-builder';
 
 // Re-export mappers
