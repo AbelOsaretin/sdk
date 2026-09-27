@@ -104,12 +104,10 @@ export function generateMockTransactionHistory(options: MockDataOptions = {}) {
 
 export function generateMockTransactionStats(seed = 1) {
   return {
-    totalTips: Math.floor(seededRandom(seed) * 500),
+    totalTransactions: Math.floor(seededRandom(seed) * 500),
     totalAmount: Math.floor(seededRandom(seed + 1) * 50000),
-    averageTip: Math.floor(seededRandom(seed + 2) * 100) + 1,
-    completedCount: Math.floor(seededRandom(seed + 3) * 400),
-    pendingCount: Math.floor(seededRandom(seed + 4) * 50),
-    failedCount: Math.floor(seededRandom(seed + 5) * 20),
+    averageAmount: Math.floor(seededRandom(seed + 2) * 100) + 1,
+    lastTransactionDate: new Date().toISOString(),
   };
 }
 
@@ -232,16 +230,29 @@ export function generateMockCreatorBalance(seed = 1) {
     totalEarnings: Math.floor(seededRandom(seed) * 50000),
     pendingBalance: Math.floor(seededRandom(seed + 1) * 5000),
     confirmedBalance: Math.floor(seededRandom(seed + 2) * 45000),
-    lumens: Math.floor(seededRandom(seed + 3) * 1000),
-    usdc: Math.floor(seededRandom(seed + 4) * 10000),
+    pending: Math.floor(seededRandom(seed + 1) * 5000),
+    nextPayoutDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+    minimumThreshold: 10,
+    total: Math.floor(seededRandom(seed) * 50000),
+    available: Math.floor(seededRandom(seed + 2) * 45000),
+    wallets: [
+      {
+        walletId: seededId(seed, 'wallet'),
+        available: Math.floor(seededRandom(seed + 3) * 1000),
+        pending: Math.floor(seededRandom(seed + 4) * 100),
+        currency: 'USDC',
+      },
+    ],
   };
 }
 
 export function generateMockCreatorEarnings(seed = 1) {
+  const balance = generateMockCreatorBalance(seed);
   return {
-    ...generateMockCreatorBalance(seed),
-    period: 'all-time',
-    tipCount: Math.floor(seededRandom(seed + 5) * 200),
+    totalEarnings: balance.totalEarnings,
+    pendingBalance: balance.pendingBalance,
+    confirmedBalance: balance.confirmedBalance,
+    transactionCount: Math.floor(seededRandom(seed + 5) * 200),
   };
 }
 
@@ -275,13 +286,15 @@ export function generateMockAccountSummary(seed = 1) {
  */
 export function generateMockVerificationStatus(seed = 1) {
   const statuses = ['unverified', 'pending', 'verified'] as const;
+  const status = statuses[Math.floor(seededRandom(seed) * statuses.length)] ?? 'pending';
   return {
-    status: statuses[Math.floor(seededRandom(seed) * statuses.length)],
+    status,
+    verified: status === 'verified',
     verifiedAt:
-      seededRandom(seed + 1) > 0.3
-        ? new Date(Date.UTC(2024, 0, 1) + Math.floor(seededRandom(seed + 2) * 180) * 86400000)
-        : null,
-    expiresAt: new Date(Date.UTC(2025, 0, 1)),
+      status === 'verified'
+        ? new Date(Date.UTC(2024, 0, 1) + Math.floor(seededRandom(seed + 2) * 180) * 86400000).toISOString()
+        : undefined,
+    expiresAt: new Date(Date.UTC(2025, 0, 1)).toISOString(),
   };
 }
 
@@ -291,7 +304,7 @@ export function generateMockVerificationStatus(seed = 1) {
 export function generateMockChallenge(seed = 1) {
   return {
     challenge: seededId(seed, 'challenge'),
-    timeout: 5 * 60 * 1000,
+    expiresIn: 300,
   };
 }
 

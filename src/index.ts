@@ -10,6 +10,16 @@ export const SDK_VERSION = '0.1.0';
 // Re-export client and utilities
 export { DorisioClient, type ClientConfig } from './client';
 
+// Re-export HTTP interceptors (public API for custom middleware)
+export { InterceptorManager } from './http/interceptors';
+export type {
+  RequestInterceptor,
+  ResponseInterceptor,
+  ErrorInterceptor,
+} from './http/interceptors';
+export type { RequestOptions } from './http/http-client';
+
+
 // Re-export types
 export type { ApiResponse, PaginationMeta, PaginatedResponse } from './types/api';
 export {
@@ -78,9 +88,50 @@ export {
   PaymentSchemas,
   CreatorSchemas,
   WalletSchemas,
+  ApiUserSchema,
+  ApiCreatorSchema,
+  ApiWalletSchema,
+  ApiTransactionSchema,
+  ApiListCreatorsSchema,
+  ApiTransactionHistorySchema,
+  ApiTransactionStatsSchema,
+  ApiSessionSchema,
+  ApiSessionExpirySchema,
+  ApiBalanceInfoSchema,
+  ApiAccountBalanceSchema,
+  ApiCreatorEarningsSchema,
+  ApiCreatorPendingPayoutSchema,
+  ApiAccountSummarySchema,
+  ApiVerificationStatusSchema,
+  ApiWalletChallengeSchema,
+  type LoginInput,
+  type RegisterInput,
+  type WalletChallengeInput,
+  type WalletVerificationInput,
   type CreateTipInput,
   type TransactionDetails,
+  type PaymentHistoryFilterInput,
+  type CreatorProfileInput,
+  type CreatorVerificationInput,
+  type CreatorPayoutInput,
   type WalletInfo,
+  type LinkWalletInput,
+  type ApiUser,
+  type ApiCreator,
+  type ApiWallet,
+  type ApiTransaction,
+  type ApiListCreators,
+  type ApiTransactionHistory,
+  type ApiTransactionStats,
+  type ApiSession,
+  type ApiSessionExpiry,
+  type ApiBalanceInfo,
+  type ApiAccountBalance,
+  type ApiCreatorEarnings,
+  type ApiCreatorPendingPayout,
+  type ApiAccountSummary,
+  type ApiVerificationStatus,
+  type ApiWalletChallenge,
 } from './types/schemas';
 
 // Re-export sandbox utilities
@@ -122,6 +173,8 @@ export {
   normalizeWallets,
   normalizeTransaction,
   normalizeTransactions,
+  normalizeCreateTip,
+  normalizeCreateTipInput,
 } from './utils/normalizers';
 
 // Re-export transaction normalizers
@@ -139,5 +192,10 @@ export {
 
 // Re-export client method types
 export type { BalanceInfo, AccountBalance } from './client/balance';
+export {
+  getCreators,
+  getAllTransactionHistory,
+  getAllWalletBalances,
+} from './client/batch-operations';
 export type { VerificationStatus } from './client/verification';
 export type { SessionInfo } from './client/auth';

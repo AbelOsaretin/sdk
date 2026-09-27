@@ -74,7 +74,7 @@ describe('Sandbox mode', () => {
     const tipB = await b.createTip({ creatorId: 'x', amount: 1 });
 
     expect(tipA.id).toBe(tipB.id);
-    expect(tipA.transactionHash).toBe(tipB.transactionHash);
+    expect(tipA.stellarTxHash).toBe(tipB.stellarTxHash);
   });
 
   it('toggles between sandbox and live without recreating the client', async () => {
