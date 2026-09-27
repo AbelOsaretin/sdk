@@ -154,37 +154,37 @@ export function useTransactionHistory(
           onError: (error) => safeSetState((s) => ({ ...s, error, loading: false })),
           isMounted: () => isMountedRef.current,
         },
-        async () => {
-          // Claim this fetch's generation up front and cancel whatever is
-          // still in flight — its response (or abort error) is stale by
-          // definition and must never touch state.
-          const requestId = ++requestIdRef.current;
-          abortRef.current?.abort();
-          const controller = new AbortController();
-          abortRef.current = controller;
-          const isStale = () => requestId !== requestIdRef.current;
+        () =>
+          withAbort(async (signal) => {
+            // Claim this fetch's generation up front and cancel whatever is
+            // still in flight — its response (or abort error) is stale by
+            // definition and must never touch state.
+            const requestId = ++requestIdRef.current;
+            abortRef.current?.abort();
+            const currentController = Array.from(abortControllersRef.current).pop();
+            abortRef.current = currentController ?? null;
+            const isStale = () => requestId !== requestIdRef.current;
 
-          const current = stateRef.current;
-          const page = options?.page ?? current.page;
-          const pageSize = options?.pageSize ?? current.pageSize;
-          // Explicit `undefined` clears creator filter; omit to keep last creatorId.
-          const resolvedCreator = creator !== undefined ? creator : creatorIdRef.current;
-          const endpoint = resolvedCreator
-            ? `/api/v1/transactions/creator/${resolvedCreator}`
-            : '/api/v1/transactions/history';
-          const query = `?page=${page}&pageSize=${pageSize}`;
+            const current = stateRef.current;
+            const page = options?.page ?? current.page;
+            const pageSize = options?.pageSize ?? current.pageSize;
+            // Explicit `undefined` clears creator filter; omit to keep last creatorId.
+            const resolvedCreator = creator !== undefined ? creator : creatorIdRef.current;
+            const endpoint = resolvedCreator
+              ? `/api/v1/transactions/creator/${resolvedCreator}`
+              : '/api/v1/transactions/history';
+            const query = `?page=${page}&pageSize=${pageSize}`;
 
-          let response;
-          try {
-            response = await client.request('GET', `${endpoint}${query}`, undefined, {
-              signal: controller.signal,
-            });
-          } catch (err) {
-            // A superseded request's failure (including its own abort) is
-            // not an error — silently keep current state.
-            if (isStale()) return stateRef.current.transactions;
-            throw err;
-          }
+            let response;
+            try {
+              response = await client.request('GET', `${endpoint}${query}`, undefined, {
+                signal,
+              });
+            } catch (err) {
+              if (!isMountedRef.current) throw err;
+              if (isStale()) return stateRef.current.transactions;
+              throw err;
+            }
           if (isStale()) return stateRef.current.transactions;
 
           if (!response.success || !response.data) {
@@ -216,7 +216,7 @@ export function useTransactionHistory(
           creatorIdRef.current = resolvedCreator;
 
           return transactions;
-        }
+        })
       ),
     [client, setError, setIsLoading, safeSetState]
   );

@@ -43,6 +43,13 @@ import {
   ErrorHandler,
   Middleware,
 } from './types/errors';
+import type { MetricsCallback, MetricsSummary } from './lib/metrics';
+import type { OfflineEventType, OfflineEventListener } from './http/offline-queue';
+import {
+  ApiVersionHandler,
+  type DeprecationWarning,
+  type DeprecatedEndpointConfig,
+} from './http/api-version-handler';
 
 export type ClientMode = 'sandbox' | 'live' | 'production';
 
@@ -67,13 +74,32 @@ export interface ClientConfig {
   deduplicationWindow?: number;
   /** Custom error handler for error recovery strategies */
   errorHandler?: ErrorHandler;
-  /**
-   * Additional API endpoints for failover / load balancing.
-   * When provided, the client automatically fails over on errors.
-   */
-  endpoints?: (string | EndpointConfig)[];
-  /** Health check interval in ms for multi-endpoint mode (default 30000) */
-  healthCheckInterval?: number;
+  /** Target or default API version (e.g. 'v1', 'v2') */
+  apiVersion?: string;
+  /** Supported API versions for validation and fallback */
+  supportedApiVersions?: string[];
+  /** Fallback API version when an unsupported version is encountered */
+  fallbackApiVersion?: string;
+  /** Automatically migrate requests/responses across versions (default true) */
+  autoMigrateApiVersion?: boolean;
+  /** Pre-configured deprecated endpoints */
+  deprecatedEndpoints?: DeprecatedEndpointConfig[];
+  /** Custom ApiVersionHandler instance */
+  apiVersionHandler?: ApiVersionHandler;
+  /** Callback invoked when a version change is detected from response headers */
+  onApiVersionChange?: (oldVersion: string, newVersion: string) => void;
+  /** Callback invoked when a deprecated endpoint is accessed or deprecation header received */
+  onApiDeprecation?: (warning: DeprecationWarning) => void;
+  /** Enable request queue with concurrency control and automatic 429 backoff */
+  enableRequestQueue?: boolean;
+  /** Maximum concurrent requests in flight when request queue is enabled (default: 5) */
+  maxConcurrentRequests?: number;
+  /** Enable offline mutation queue */
+  enableOfflineQueue?: boolean;
+  /** Enable performance metrics collection */
+  enableMetrics?: boolean;
+  /** Optional callback invoked whenever a request metric is recorded */
+  metricsCallback?: MetricsCallback;
 }
 
 function normalizeClientMode(mode?: ClientMode): 'live' | 'sandbox' {
@@ -88,7 +114,7 @@ export class DorisioClient {
   private mode: 'live' | 'sandbox';
   private errorHandler?: ErrorHandler;
   private middleware: Middleware[] = [];
-  private failoverManager?: FailoverManager;
+  private apiVersionHandler: ApiVersionHandler;
 
   constructor(config: ClientConfig) {
     const mode = normalizeClientMode(config.mode);
@@ -106,11 +132,37 @@ export class DorisioClient {
       deduplicateRequests: config.deduplicateRequests,
       deduplicationWindow: config.deduplicationWindow,
       errorHandler: config.errorHandler,
+      apiVersion: config.apiVersion,
+      supportedApiVersions: config.supportedApiVersions,
+      fallbackApiVersion: config.fallbackApiVersion,
+      autoMigrateApiVersion: config.autoMigrateApiVersion,
+      deprecatedEndpoints: config.deprecatedEndpoints,
+      apiVersionHandler: config.apiVersionHandler,
+      onApiVersionChange: config.onApiVersionChange,
+      onApiDeprecation: config.onApiDeprecation,
+      enableRequestQueue: config.enableRequestQueue,
+      maxConcurrentRequests: config.maxConcurrentRequests,
+      enableOfflineQueue: config.enableOfflineQueue,
+      enableMetrics: config.enableMetrics,
+      metricsCallback: config.metricsCallback,
     };
 
     this.token = config.token;
     this.mode = mode;
     this.errorHandler = config.errorHandler;
+
+    this.apiVersionHandler =
+      config.apiVersionHandler ||
+      new ApiVersionHandler({
+        currentVersion: config.apiVersion || 'v1',
+        supportedVersions: config.supportedApiVersions,
+        fallbackVersion: config.fallbackApiVersion,
+        autoMigrate: config.autoMigrateApiVersion ?? true,
+        deprecatedEndpoints: config.deprecatedEndpoints,
+        onVersionChange: config.onApiVersionChange,
+        onDeprecation: config.onApiDeprecation,
+        logger: config.logger,
+      });
 
     this.httpClient = new HttpClient(this.config.baseUrl, {
       timeout: this.config.timeout,
@@ -124,6 +176,14 @@ export class DorisioClient {
       deduplicateRequests: config.deduplicateRequests,
       deduplicationWindow: config.deduplicationWindow,
       errorHandler: this.errorHandler,
+      enableRequestQueue: config.enableRequestQueue,
+      maxConcurrentRequests: config.maxConcurrentRequests,
+      enableOfflineQueue: config.enableOfflineQueue,
+      enableMetrics: config.enableMetrics,
+      metricsCallback: config.metricsCallback,
+      onResponse: (response: Response) => {
+        this.apiVersionHandler.checkResponseHeaders(response.headers);
+      },
     });
 
     if (this.token) {
@@ -230,25 +290,56 @@ export class DorisioClient {
     body?: unknown,
     options?: Partial<RequestOptions>
   ): Promise<ApiResponse<T>> {
-    const requestBody = body;
-    const requestHeaders = options?.headers;
+    this.apiVersionHandler.checkEndpointDeprecation(path);
+
+    const initialHeaders = options?.headers ? { ...options.headers } : {};
+    const migrated = this.apiVersionHandler.migrateRequest({
+      method,
+      path,
+      body,
+      headers: initialHeaders,
+    });
+
+    const requestBody = migrated.body;
+    const requestHeaders = migrated.headers;
+    const requestPath = migrated.path;
+    const requestMethod = (migrated.method || method) as 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+    const mergedOptions: Partial<RequestOptions> = {
+      ...options,
+      headers: requestHeaders,
+      onResponse: (response: Response) => {
+        this.apiVersionHandler.checkResponseHeaders(response.headers, requestPath);
+        options?.onResponse?.(response);
+      },
+    };
 
     // Execute middleware chain for request transformation
     const executeMiddleware = async (index: number): Promise<ApiResponse<T>> => {
       if (index >= this.middleware.length) {
         // All middleware executed, make the actual request
-        return this.executeWithFailover<T>(method, path, requestBody, requestHeaders, options);
+        return this.httpClient.request<ApiResponse<T>>(requestPath, {
+          method: requestMethod,
+          body: requestBody as Record<string, unknown>,
+          headers: requestHeaders,
+          ...mergedOptions,
+        });
       }
 
       const middleware = this.middleware[index];
       if (!middleware) {
-        return this.executeWithFailover<T>(method, path, requestBody, requestHeaders, options);
+        return this.httpClient.request<ApiResponse<T>>(requestPath, {
+          method: requestMethod,
+          body: requestBody as Record<string, unknown>,
+          headers: requestHeaders,
+          ...mergedOptions,
+        });
       }
 
       const result = await middleware(
         {
-          method,
-          path,
+          method: requestMethod,
+          path: requestPath,
           body: requestBody,
           headers: requestHeaders,
           requestId: options?.requestId,
@@ -259,7 +350,13 @@ export class DorisioClient {
       return result as ApiResponse<T>;
     };
 
-    return executeMiddleware(0);
+    const res = await executeMiddleware(0);
+    return this.apiVersionHandler.migrateResponse(
+      res,
+      this.apiVersionHandler.getCurrentVersion(),
+      this.apiVersionHandler.getCurrentVersion(),
+      { path: requestPath, method: requestMethod }
+    );
   }
 
   private async executeWithFailover<T>(
@@ -381,6 +478,80 @@ export class DorisioClient {
    */
   use(middleware: Middleware): void {
     this.middleware.push(middleware);
+  }
+
+  /**
+   * Get currently active API version
+   */
+  getApiVersion(): string {
+    return this.apiVersionHandler.getCurrentVersion();
+  }
+
+  /**
+   * Set active API version
+   */
+  setApiVersion(version: string): void {
+    this.apiVersionHandler.setCurrentVersion(version);
+  }
+
+  /**
+   * Get API version handler instance
+   */
+  getApiVersionHandler(): ApiVersionHandler {
+    return this.apiVersionHandler;
+  }
+
+  /**
+   * Detect API version from headers
+   */
+  detectApiVersion(
+    headers?: Record<string, string | string[] | undefined> | Headers
+  ): string | undefined {
+    return this.apiVersionHandler.detectVersionFromHeaders(headers);
+  }
+
+  /**
+   * Get performance metrics summary
+   */
+  getMetrics(): MetricsSummary {
+    return this.httpClient.getMetrics();
+  }
+
+  /**
+   * Check if client considers itself online
+   */
+  isOnline(): boolean {
+    return this.httpClient.isOnline();
+  }
+
+  /**
+   * Set online status (triggers offline queue replay when switching to true)
+   */
+  setOnline(online: boolean): void {
+    this.httpClient.setOnline(online);
+  }
+
+  /**
+   * Get number of mutations currently queued offline
+   */
+  getOfflineQueueSize(): number {
+    return this.httpClient.getOfflineQueueSize();
+  }
+
+  /**
+   * Listen to offline events ('online', 'offline', 'queue-processed')
+   */
+  on(event: OfflineEventType, listener: OfflineEventListener): this {
+    this.httpClient.getOfflineQueue()?.on(event, listener);
+    return this;
+  }
+
+  /**
+   * Remove an offline event listener
+   */
+  off(event: OfflineEventType, listener: OfflineEventListener): this {
+    this.httpClient.getOfflineQueue()?.off(event, listener);
+    return this;
   }
 
   // ---------------------------------------------------------------------------
