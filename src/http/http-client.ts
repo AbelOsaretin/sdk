@@ -10,6 +10,7 @@ import { ApiError } from '../types';
 import { InterceptorManager } from './interceptors';
 import { generateRequestId, isRequestIdempotent, RetryConflictError } from './retry-manager';
 import { MockRouter, type SandboxHistoryEntry } from '../sandbox/mock-router';
+import { isRequestIdempotent } from './retry-manager';
 
 export type HttpClientMode = 'live' | 'sandbox' | 'production';
 
@@ -375,7 +376,12 @@ export class HttpClient {
     const headers = { ...this.defaultHeaders, ...options.headers };
 
     let lastError: Error | null = null;
-    const attempts = options.retries ?? this.retryAttempts;
+    const attempts = finalOptions.retries ?? this.retryAttempts;
+    const canRetry = isRequestIdempotent({
+      method: finalOptions.method,
+      isIdempotent: finalOptions.isIdempotent,
+      headers,
+    });
 
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
@@ -409,6 +415,7 @@ export class HttpClient {
         }
 
         const data = (await response.json()) as T;
+
         return await this.interceptors.executeResponseInterceptors(data);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -436,6 +443,11 @@ export class HttpClient {
         });
         if (!idempotent) {
           throw error;
+        }
+
+        // Never retry non-idempotent calls (avoids duplicate tips/charges)
+        if (!canRetry) {
+          throw lastError;
         }
 
         if (attempt < attempts - 1) {
