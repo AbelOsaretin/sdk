@@ -11,6 +11,14 @@ export const SDK_VERSION = '0.1.0';
 export { DorisioClient, type ClientConfig } from './client';
 
 // Re-export HTTP interceptors (public API for custom middleware)
+export {
+  ApiVersionHandler,
+  type ApiVersionHandlerOptions,
+  type DeprecationWarning,
+  type DeprecatedEndpointConfig,
+  type RequestMigrationContext,
+  type VersionMigration,
+} from './http/api-version-handler';
 export { InterceptorManager } from './http/interceptors';
 export type {
   RequestInterceptor,
