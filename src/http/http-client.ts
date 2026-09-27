@@ -211,6 +211,14 @@ export class HttpClient {
   }
 
   /**
+   * Emit sanitized request/response diagnostics through the configured logger.
+   */
+  private log(message: string, data?: unknown): void {
+    if (!this.debug) return;
+    this.logger(message, data);
+  }
+
+  /**
    * Get interceptor manager
    */
   getInterceptors(): InterceptorManager {
