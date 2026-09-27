@@ -10,7 +10,6 @@ import { ApiError, DorisioError, ErrorHandler, ErrorHandlerContext } from '../ty
 import { InterceptorManager } from './interceptors';
 import { generateRequestId, isRequestIdempotent, RetryConflictError } from './retry-manager';
 import { MockRouter, type SandboxHistoryEntry } from '../sandbox/mock-router';
-import { isRequestIdempotent } from './retry-manager';
 
 export type HttpClientMode = 'live' | 'sandbox' | 'production';
 
@@ -38,6 +37,12 @@ export interface RequestOptions {
    * omitted.
    */
   requestId?: string;
+  /**
+   * Label for the client method that issued the request
+   * (e.g. `createTip`). Used for diagnostics and per-method error reporting;
+   * it is never sent to the network.
+   */
+  methodName?: string;
 }
 
 export interface HttpClientOptions {
@@ -175,6 +180,14 @@ export class HttpClient {
     if (this.deduplicationWindow < 0) {
       throw new Error('deduplicationWindow must be greater than or equal to zero');
     }
+  }
+
+  /**
+   * Emit sanitized request/response diagnostics through the configured logger.
+   */
+  private log(message: string, data?: unknown): void {
+    if (!this.debug) return;
+    this.logger(message, data);
   }
 
   /**
@@ -383,10 +396,10 @@ export class HttpClient {
     const headers = { ...this.defaultHeaders, ...options.headers };
 
     let lastError: Error | null = null;
-    const attempts = finalOptions.retries ?? this.retryAttempts;
+    const attempts = options.retries ?? this.retryAttempts;
     const canRetry = isRequestIdempotent({
-      method: finalOptions.method,
-      isIdempotent: finalOptions.isIdempotent,
+      method: options.method,
+      isIdempotent: options.isIdempotent,
       headers,
     });
 
