@@ -10,6 +10,9 @@ import { ApiError, DorisioError, ErrorHandler, ErrorHandlerContext } from '../ty
 import { InterceptorManager } from './interceptors';
 import { generateRequestId, isRequestIdempotent, RetryConflictError } from './retry-manager';
 import { MockRouter, type SandboxHistoryEntry } from '../sandbox/mock-router';
+import { RequestQueue } from './request-queue';
+import { OfflineQueue } from './offline-queue';
+import { MetricsCollector, type MetricsSummary, type MetricsCallback } from '../lib/metrics';
 
 export type HttpClientMode = 'live' | 'sandbox' | 'production';
 
@@ -37,11 +40,9 @@ export interface RequestOptions {
    * omitted.
    */
   requestId?: string;
-  /**
-   * Label for the client method that issued the request
-   * (e.g. `createTip`). Used for diagnostics and per-method error reporting;
-   * it is never sent to the network.
-   */
+  /** Hook called with raw Response object when live fetch completes. */
+  onResponse?: (response: Response) => void;
+  /** Method name for metrics tracking */
   methodName?: string;
 }
 
@@ -65,6 +66,13 @@ export interface HttpClientOptions {
   deduplicationWindow?: number;
   /** Custom error handler for error recovery strategies */
   errorHandler?: ErrorHandler;
+  /** Hook called with raw Response object when live fetch completes. */
+  onResponse?: (response: Response) => void;
+  enableRequestQueue?: boolean;
+  maxConcurrentRequests?: number;
+  enableOfflineQueue?: boolean;
+  enableMetrics?: boolean;
+  metricsCallback?: MetricsCallback;
 }
 
 function normalizeMode(mode?: HttpClientMode): 'live' | 'sandbox' {
@@ -156,6 +164,10 @@ export class HttpClient {
   private deduplicationWindow: number;
   private deduplicationCache = new Map<string, CachedRequest>();
   private errorHandler?: ErrorHandler;
+  private onResponse?: (response: Response) => void;
+  private requestQueue?: RequestQueue;
+  private offlineQueue?: OfflineQueue;
+  private metricsCollector: MetricsCollector;
 
   constructor(baseUrl: string, options?: HttpClientOptions) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -177,9 +189,25 @@ export class HttpClient {
     this.deduplicateRequests = options?.deduplicateRequests ?? false;
     this.deduplicationWindow = options?.deduplicationWindow ?? 1000;
     this.errorHandler = options?.errorHandler;
+    this.onResponse = options?.onResponse;
     if (this.deduplicationWindow < 0) {
       throw new Error('deduplicationWindow must be greater than or equal to zero');
     }
+
+    if (options?.enableRequestQueue) {
+      this.requestQueue = new RequestQueue({
+        maxConcurrentRequests: options.maxConcurrentRequests,
+      });
+    }
+
+    if (options?.enableOfflineQueue) {
+      this.offlineQueue = new OfflineQueue();
+    }
+
+    this.metricsCollector = new MetricsCollector({
+      enabled: options?.enableMetrics ?? false,
+      callback: options?.metricsCallback,
+    });
   }
 
   /**
@@ -212,6 +240,13 @@ export class HttpClient {
    */
   setErrorHandler(handler: ErrorHandler): void {
     this.errorHandler = handler;
+  }
+
+  /**
+   * Register a callback for raw fetch responses (used for version detection and header inspection)
+   */
+  setOnResponse(handler?: (response: Response) => void): void {
+    this.onResponse = handler;
   }
 
   /**
@@ -254,6 +289,10 @@ export class HttpClient {
     return [...this.inFlightRequests];
   }
 
+  getConnectionPoolStats() {
+    return this.connectionPool.stats();
+  }
+
   configureSandbox(options: {
     seed?: number;
     latency?: number;
@@ -279,51 +318,101 @@ export class HttpClient {
    * records performance metrics, and supports 401 token refresh.
    */
   async request<T>(path: string, options: RequestOptions): Promise<T> {
-    const requestId = options.requestId ?? generateRequestId('http');
+    const startTime = Date.now();
+    const methodName = options.methodName || options.method;
+    let success = false;
+    let statusCode: number | undefined;
+    let rateLimited = false;
 
-    // One logical request may only run one retry sequence at a time. Two
-    // concurrent callers reusing an id would otherwise double-submit the same
-    // work (and could exceed the intended retry budget), so reject the
-    // duplicate instead of racing it.
-    if (this.inFlightRequests.has(requestId)) {
-      throw new RetryConflictError(requestId);
-    }
-    try {
-      const seeded: RequestOptions = {
-        ...options,
-        requestId,
-        headers: withRequestIdHeader(options.headers, requestId),
-      };
-      const finalOptions = await this.interceptors.executeRequestInterceptors(seeded);
+    const executeInternal = async (): Promise<T> => {
+      const requestId = options.requestId ?? generateRequestId('http');
 
-      const key = `${finalOptions.method}:${path}:${stableSerialize(finalOptions.body ?? null)}`;
-      if (this.deduplicateRequests) {
-        const cached = this.deduplicationCache.get(key);
-        if (cached && cached.expiresAt > Date.now()) return cached.promise as Promise<T>;
-        if (cached) this.deduplicationCache.delete(key);
+      // One logical request may only run one retry sequence at a time. Two
+      // concurrent callers reusing an id would otherwise double-submit the same
+      // work (and could exceed the intended retry budget), so reject the
+      // duplicate instead of racing it.
+      if (this.inFlightRequests.has(requestId)) {
+        throw new RetryConflictError(requestId);
       }
       this.inFlightRequests.add(requestId);
 
-      const result = await this.executeDeduplication<T>(key, async () => {
-        if (this.mode === 'sandbox') {
-          const mocked = await this.mockRouter.handle(finalOptions.method, path, finalOptions.body);
-          return (await this.interceptors.executeResponseInterceptors(mocked)) as T;
+      try {
+        const seeded: RequestOptions = {
+          ...options,
+          requestId,
+          headers: withRequestIdHeader(options.headers, requestId),
+        };
+        const finalOptions = await this.interceptors.executeRequestInterceptors(seeded);
+
+        const key = `${finalOptions.method}:${path}:${stableSerialize(finalOptions.body ?? null)}`;
+        if (this.deduplicateRequests) {
+          const cached = this.deduplicationCache.get(key);
+          if (cached && cached.expiresAt > Date.now()) return cached.promise as Promise<T>;
+          if (cached) this.deduplicationCache.delete(key);
         }
-        try {
-          return await this.sendWithRetries<T>(path, finalOptions);
-        } catch (error) {
-          if (!this.canRecoverFrom(error, path, finalOptions)) throw error;
-          try {
-            await this.refreshSessionOnce();
-          } catch {
-            throw error;
+
+        const result = await this.executeDeduplication<T>(key, async () => {
+          if (this.mode === 'sandbox') {
+            const mocked = await this.mockRouter.handle(finalOptions.method, path, finalOptions.body);
+            return (await this.interceptors.executeResponseInterceptors(mocked)) as T;
           }
-          return await this.sendWithRetries<T>(path, finalOptions);
-        }
-      });
+          try {
+            return await this.sendWithRetries<T>(path, finalOptions);
+          } catch (error) {
+            if (!this.canRecoverFrom(error, path, finalOptions)) throw error;
+            try {
+              await this.refreshSessionOnce();
+            } catch {
+              throw error;
+            }
+            return await this.sendWithRetries<T>(path, finalOptions);
+          }
+        });
+        return result;
+      } finally {
+        this.inFlightRequests.delete(requestId);
+      }
+    };
+
+    const executeWithQueue = (): Promise<T> => {
+      if (this.requestQueue) {
+        return this.requestQueue.enqueue(executeInternal);
+      }
+      return executeInternal();
+    };
+
+    const executeWithOffline = (): Promise<T> => {
+      if (this.offlineQueue) {
+        return this.offlineQueue.handleRequest(options.method, path, executeWithQueue);
+      }
+      return executeWithQueue();
+    };
+
+    try {
+      const result = await executeWithOffline();
+      success = true;
+      statusCode = 200;
       return result;
+    } catch (error) {
+      if (error instanceof ApiError && error.statusCode !== undefined) {
+        statusCode = error.statusCode;
+        if (error.statusCode === 429) {
+          rateLimited = true;
+        }
+      }
+      throw error;
     } finally {
-      this.inFlightRequests.delete(requestId);
+      if (this.metricsCollector?.isEnabled()) {
+        const latency = Date.now() - startTime;
+        this.metricsCollector.record({
+          method: methodName,
+          path,
+          latency,
+          success,
+          statusCode,
+          rateLimited,
+        });
+      }
     }
   }
 
@@ -383,6 +472,12 @@ export class HttpClient {
     return this.refreshPromise;
   }
 
+  private log(message: string, data?: unknown): void {
+    if (this.debug) {
+      this.logger(message, data);
+    }
+  }
+
   /**
    * Retry loop for a single attempt to reach the API.
    *
@@ -404,7 +499,9 @@ export class HttpClient {
     });
 
     for (let attempt = 0; attempt < attempts; attempt++) {
+      let release: (() => void) | undefined;
       try {
+        release = await this.connectionPool.acquire(options.signal);
         const startedAt = Date.now();
         this.log('[DORISIO] request', {
           method: options.method,
@@ -421,6 +518,8 @@ export class HttpClient {
             ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeout ?? this.timeout)])
             : AbortSignal.timeout(options.timeout ?? this.timeout),
         });
+        options.onResponse?.(response);
+        this.onResponse?.(response);
         this.log('[DORISIO] response', {
           method: options.method,
           path,
@@ -453,7 +552,6 @@ export class HttpClient {
         }
 
         const data = (await response.json()) as T;
-
         return await this.interceptors.executeResponseInterceptors(data);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -461,7 +559,11 @@ export class HttpClient {
 
         // Don't retry requests the caller cancelled (superseded hook
         // requests) — retrying an aborted fetch just burns attempts.
-        if (options.signal?.aborted) {
+        if (
+          options.signal?.aborted ||
+          lastError.name === 'AbortError' ||
+          (lastError as { code?: number }).code === 20
+        ) {
           throw lastError;
         }
 
@@ -521,10 +623,16 @@ export class HttpClient {
         if (attempt < attempts - 1) {
           await new Promise((resolve) => setTimeout(resolve, Math.pow(2, attempt) * 1000));
         }
+      } finally {
+        release?.();
       }
     }
 
     throw lastError || new Error('Request failed after retries');
+  }
+
+  private log(message: string, data?: unknown): void {
+    if (this.debug) this.logger(message, data);
   }
 
   /**
