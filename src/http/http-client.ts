@@ -10,7 +10,7 @@ import { ApiError, DorisioError, ErrorHandler, ErrorHandlerContext } from '../ty
 import { InterceptorManager } from './interceptors';
 import { generateRequestId, isRequestIdempotent, RetryConflictError } from './retry-manager';
 import { MockRouter, type SandboxHistoryEntry } from '../sandbox/mock-router';
-import { isRequestIdempotent } from './retry-manager';
+import { JsonSerializer, type Serializer } from './serializer';
 
 export type HttpClientMode = 'live' | 'sandbox' | 'production';
 
@@ -60,6 +60,8 @@ export interface HttpClientOptions {
   deduplicationWindow?: number;
   /** Custom error handler for error recovery strategies */
   errorHandler?: ErrorHandler;
+  /** Custom serializer for request/response bodies (default: JSON). */
+  serializer?: Serializer;
 }
 
 function normalizeMode(mode?: HttpClientMode): 'live' | 'sandbox' {
@@ -151,6 +153,7 @@ export class HttpClient {
   private deduplicationWindow: number;
   private deduplicationCache = new Map<string, CachedRequest>();
   private errorHandler?: ErrorHandler;
+  private serializer: Serializer;
 
   constructor(baseUrl: string, options?: HttpClientOptions) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -172,6 +175,7 @@ export class HttpClient {
     this.deduplicateRequests = options?.deduplicateRequests ?? false;
     this.deduplicationWindow = options?.deduplicationWindow ?? 1000;
     this.errorHandler = options?.errorHandler;
+    this.serializer = options?.serializer ?? new JsonSerializer();
     if (this.deduplicationWindow < 0) {
       throw new Error('deduplicationWindow must be greater than or equal to zero');
     }
@@ -199,6 +203,20 @@ export class HttpClient {
    */
   setErrorHandler(handler: ErrorHandler): void {
     this.errorHandler = handler;
+  }
+
+  /**
+   * Set custom serializer for request/response bodies
+   */
+  setSerializer(serializer: Serializer): void {
+    this.serializer = serializer;
+  }
+
+  /**
+   * Get current serializer
+   */
+  getSerializer(): Serializer {
+    return this.serializer;
   }
 
   /**
@@ -383,17 +401,17 @@ export class HttpClient {
     const headers = { ...this.defaultHeaders, ...options.headers };
 
     let lastError: Error | null = null;
-    const attempts = finalOptions.retries ?? this.retryAttempts;
+    const attempts = options.retries ?? this.retryAttempts;
     const canRetry = isRequestIdempotent({
-      method: finalOptions.method,
-      isIdempotent: finalOptions.isIdempotent,
+      method: options.method,
+      isIdempotent: options.isIdempotent,
       headers,
     });
 
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
         const startedAt = Date.now();
-        this.log('[DORISIO] request', {
+        this.logger('[DORISIO] request', {
           method: options.method,
           path,
           body: sanitize(options.body),
@@ -403,12 +421,12 @@ export class HttpClient {
         const response = await fetch(url, {
           method: options.method,
           headers,
-          body: options.body ? JSON.stringify(options.body) : undefined,
+          body: options.body ? this.serializer.serialize(options.body) : undefined,
           signal: options.signal
             ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeout ?? this.timeout)])
             : AbortSignal.timeout(options.timeout ?? this.timeout),
         });
-        this.log('[DORISIO] response', {
+        this.logger('[DORISIO] response', {
           method: options.method,
           path,
           status: response.status,
@@ -417,7 +435,18 @@ export class HttpClient {
         });
 
         if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
+          let error: Record<string, unknown> = {};
+          try {
+            const errorText = await response.text();
+            error = errorText ? this.serializer.deserialize<Record<string, unknown>>(errorText) : {};
+          } catch {
+            // Fallback for mocks that only implement json()
+            try {
+              error = await (response as { json?: () => Promise<Record<string, unknown>> }).json?.() ?? {};
+            } catch {
+              // ignore
+            }
+          }
           const retryAfterHeader = response.headers?.get?.('Retry-After');
           let retryAfter: number | undefined;
           if (retryAfterHeader) {
@@ -432,14 +461,21 @@ export class HttpClient {
             }
           }
           throw new ApiError(
-            error.error || 'Request failed',
+            String(error.error) || 'Request failed',
             response.status,
-            error.code,
+            error.code as string | undefined,
             retryAfter
           );
         }
 
-        const data = (await response.json()) as T;
+        let data: T;
+        try {
+          const text = await response.text();
+          data = this.serializer.deserialize<T>(text);
+        } catch {
+          // Fallback for mocks that only implement json()
+          data = await (response as { json?: () => Promise<T> }).json?.() ?? (undefined as T);
+        }
 
         return await this.interceptors.executeResponseInterceptors(data);
       } catch (error) {
@@ -478,7 +514,7 @@ export class HttpClient {
             // action === 'throw' falls through to throw error
           } catch (handlerError) {
             // If error handler itself fails, log and continue with normal error handling
-            this.log('[DORISIO] error handler failed', { error: handlerError });
+            this.logger('[DORISIO] error handler failed', { error: handlerError });
           }
         }
 
